@@ -1,17 +1,30 @@
 package com.example.jarvis_android
 
 import android.content.Context
+import android.content.Intent
 import android.media.MediaPlayer
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationDrawerItem
+import androidx.compose.material3.NavigationDrawerItemDefaults
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -24,312 +37,337 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
-// ---- Настройки твоих серверов ----
+// ---- адреса серверов ----
 private const val CHAT_URL = "http://192.168.100.8:1234/v1/chat/completions"
 private const val CHAT_MODEL = "openai/gpt-oss-20b"
 
-private const val TTS_BASE = "http://192.168.100.8:8001"     // <-- твой FastAPI TTS
+private const val TTS_BASE = "http://192.168.100.8:8001"
 private const val TTS_CLONE = "$TTS_BASE/v1/clone"
 private const val TTS_SAY   = "$TTS_BASE/v1/tts"
-private const val VOICE_ID  = "jarvis"                       // имя спикера на сервере
+private const val TTS_HEALTH = "$TTS_BASE/health"
+
+private const val VOICE_ID = "jarvis"
+private const val DEFAULT_ASSET = "instruction.wav"
 
 data class UiMsg(val role: String, val content: String)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { SimpleChatWithTts() }
+        // ВАЖНО: весь UI — только внутри setContent { App() }
+        setContent { App() }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SimpleChatWithTts() {
+fun App() {
+    // ---- состояние UI ТОЛЬКО здесь (внутри @Composable) ----
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
     var input by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
-    var useVoice by remember { mutableStateOf(true) }
-    var cloned by remember { mutableStateOf(false) }
+    var useVoice by rememberSaveable { mutableStateOf(true) }
+    var showVoiceMenu by remember { mutableStateOf(false) }
+
     var history by remember {
-        mutableStateOf(listOf(UiMsg("system",
-            "Ты помощник Jarvis на Android. Отвечай кратко и по делу.")))
+        mutableStateOf(listOf(UiMsg("system", "Ты помощник Jarvis на Android. Отвечай кратко и по делу.")))
     }
     val ui = history.filter { it.role != "system" }
-    val scope = rememberCoroutineScope()
-    val context = androidx.compose.ui.platform.LocalContext.current
 
-    // MediaPlayer для воспроизведения
+    // медиаплеер
     var player by remember { mutableStateOf<MediaPlayer?>(null) }
     DisposableEffect(Unit) { onDispose { player?.release() } }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Jarvis — LM Studio + TTS") },
-                actions = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Голос")
-                        Spacer(Modifier.width(6.dp))
-                        Switch(checked = useVoice, onCheckedChange = { useVoice = it })
-                        Spacer(Modifier.width(12.dp))
-                        Button(
-                            enabled = !cloned,
-                            onClick = {
-                                scope.launch {
-                                    val ok = cloneVoiceFromAsset(context, "instruction.wav", VOICE_ID)
-                                    cloned = ok
-                                    if (!ok) {
-                                        // покажем статус в чате
-                                        history = history + UiMsg("assistant", "Клонирование не удалось. Проверь TTS сервер и voice_ref.wav.")
-                                    } else {
-                                        history = history + UiMsg("assistant", "Голос склонирован как \"$VOICE_ID\".")
-                                    }
-                                }
-                            }
-                        ) { Text(if (cloned) "Готово" else "Клонировать голос") }
-                        Spacer(Modifier.width(8.dp))
-                    }
-                }
-            )
-        },
-        bottomBar = {
-            Row(
-                Modifier.fillMaxWidth().padding(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = input,
-                    onValueChange = { input = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Напиши сообщение…") },
-                    singleLine = true,
-                    enabled = !sending
-                )
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    enabled = input.isNotBlank() && !sending,
-                    onClick = {
-                        val text = input.trim()
-                        input = ""
-                        history = history + UiMsg("user", text)
-                        sending = true
-                        scope.launch {
-                            val reply = callLlm(history)
-                            history = history + UiMsg("assistant", reply)
-                            sending = false
+    // автоинициализация голоса дефолтным WAV (один раз при старте)
+    LaunchedEffect(Unit) {
+        val ok = ensureVoice(context, VOICE_ID, DEFAULT_ASSET)
+        if (!ok) snackbar.showMsg("Не удалось инициализировать голос (TTS).")
+    }
 
-                            if (useVoice) {
-                                // Если голос ещё не клонировали — попробуем разово
-                                if (!cloned) {
-                                    val ok = cloneVoiceFromAsset(context, "instruction.wav", VOICE_ID)
-                                    cloned = ok
-                                }
-                                // Синтез и проигрывание
-                                val wavPath = ttsSpeakToFile(reply, VOICE_ID, context.cacheDir)
-                                if (wavPath != null) {
-                                    player?.release()
-                                    player = MediaPlayer().apply {
-                                        setDataSource(wavPath)
-                                        setOnPreparedListener { start() }
-                                        setOnCompletionListener {
-                                            it.release()
-                                            player = null
-                                            // удалим временный файл
-                                            try { File(wavPath).delete() } catch (_: Exception) {}
+    // выбор WAV-файла из проводника
+    val pickWavLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                val ok = cloneVoiceFromUri(context, uri, VOICE_ID)
+                if (ok) snackbar.showMsg("Голос обновлён из выбранного WAV")
+                else snackbar.showMsg("Не удалось применить выбранный WAV")
+            }
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) { }
+        }
+    }
+
+    // ---- Левое свайп-меню ----
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        gesturesEnabled = true,
+        drawerContent = {
+            ModalDrawerSheet {
+                Spacer(Modifier.height(12.dp))
+                Text("Меню", modifier = Modifier.padding(horizontal = 16.dp),
+                    style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(8.dp))
+
+                NavigationDrawerItem(
+                    label = { Text("Голос") },
+                    selected = false,
+                    onClick = {
+                        showVoiceMenu = true
+                        scope.launch { drawerState.close() }
+                    },
+                    modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding)
+                )
+            }
+        }
+    ) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("Jarvis — LM + TTS") },
+                    navigationIcon = {
+                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                            Icon(imageVector = Icons.Filled.Menu, contentDescription = "menu")
+                        }
+                    }
+                )
+            },
+            snackbarHost = { SnackbarHost(snackbar) },
+            bottomBar = {
+                Row(
+                    Modifier.fillMaxWidth().padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = input,
+                        onValueChange = { input = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("Напиши сообщение…") },
+                        singleLine = true,
+                        enabled = !sending
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        enabled = input.isNotBlank() && !sending,
+                        onClick = {
+                            val text = input.trim()
+                            input = ""
+                            history = history + UiMsg("user", text)
+                            sending = true
+                            scope.launch {
+                                val reply = callLlm(history)
+                                history = history + UiMsg("assistant", reply)
+                                sending = false
+                                if (useVoice) {
+                                    val wav = ttsSpeakToFile(reply, VOICE_ID, context.cacheDir)
+                                    if (wav != null) {
+                                        player?.release()
+                                        player = MediaPlayer().apply {
+                                            setDataSource(wav)
+                                            setOnPreparedListener { start() }
+                                            setOnCompletionListener {
+                                                it.release()
+                                                player = null
+                                                try { java.io.File(wav).delete() } catch (_: Exception) {}
+                                            }
+                                            prepareAsync()
                                         }
-                                        prepareAsync()
+                                    } else {
+                                        snackbar.showMsg("TTS не удалось (см. логи)")
                                     }
-                                } else {
-                                    history = history + UiMsg("assistant", "TTS не удалось (см. логи).")
                                 }
                             }
                         }
-                    }
-                ) { Text(if (sending) "..." else "Отпр.") }
+                    ) { Text(if (sending) "..." else "Отпр.") }
+                }
             }
-        }
-    ) { inner ->
-        if (ui.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(inner), contentAlignment = Alignment.Center) {
-                Text(
-                    "LM: $CHAT_URL\nModel: $CHAT_MODEL\nTTS: $TTS_BASE\nVoice: $VOICE_ID",
-                    textAlign = TextAlign.Center
-                )
-            }
-        } else {
-            LazyColumn(Modifier.fillMaxSize().padding(inner).padding(12.dp)) {
-                items(ui) { m ->
-                    val who = if (m.role == "user") "Вы" else "Jarvis"
-                    ElevatedCard(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-                        Column(Modifier.padding(12.dp)) {
-                            Text(who, style = MaterialTheme.typography.labelLarge)
-                            Spacer(Modifier.height(6.dp))
-                            Text(m.content)
+        ) { inner ->
+            if (ui.isEmpty()) {
+                Box(Modifier.fillMaxSize().padding(inner), contentAlignment = Alignment.Center) {
+                    Text(
+                        "LM: $CHAT_URL\nModel: $CHAT_MODEL\nTTS: $TTS_BASE\nVoice: $VOICE_ID",
+                        textAlign = TextAlign.Center
+                    )
+                }
+            } else {
+                LazyColumn(Modifier.fillMaxSize().padding(inner).padding(12.dp)) {
+                    items(ui) { m ->
+                        val who = if (m.role == "user") "Вы" else "Jarvis"
+                        ElevatedCard(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text(who, style = MaterialTheme.typography.labelLarge)
+                                Spacer(Modifier.height(6.dp))
+                                Text(m.content)
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    // простое «меню Голос» как диалог (чтобы избежать путаницы с BottomSheet)
+    if (showVoiceMenu) {
+        AlertDialog(
+            onDismissRequest = { showVoiceMenu = false },
+            title = { Text("Голос") },
+            text = {
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Озвучивать ответы", modifier = Modifier.weight(1f))
+                        Switch(checked = useVoice, onCheckedChange = { useVoice = it })
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text("Выбери новый WAV-файл, чтобы сменить голос.")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    // открыть системный файл-пикер
+                    pickWavLauncher.launch(arrayOf("audio/wav", "audio/x-wav", "audio/*"))
+                    showVoiceMenu = false
+                }) { Text("Выбрать WAV-файл") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    // клонировать дефолтный из assets
+                    showVoiceMenu = false
+                    scope.launch {
+                        val ok = cloneVoiceFromAsset(context, DEFAULT_ASSET, VOICE_ID)
+                        if (ok) snackbar.showMsg("Голос перезагружен из дефолтного WAV")
+                        else snackbar.showMsg("Не удалось клонировать из ассета")
+                    }
+                }) { Text("Клонировать (дефолт)") }
+            }
+        )
     }
 }
 
-/* -------------------- LLM (как раньше) -------------------- */
+/* ---------- утилита для снекбара (НЕ composable) ---------- */
+private suspend fun SnackbarHostState.showMsg(msg: String) {
+    withContext(Dispatchers.Main) { showSnackbar(msg) }
+}
 
+/* ---------- LLM (НЕ composable) ---------- */
 private suspend fun callLlm(history: List<UiMsg>): String = withContext(Dispatchers.IO) {
-    val url = URL(CHAT_URL)
-    val conn = (url.openConnection() as HttpURLConnection).apply {
-        requestMethod = "POST"
-        doOutput = true
+    val conn = (URL(CHAT_URL).openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"; doOutput = true
         setRequestProperty("Content-Type", "application/json; charset=utf-8")
-        connectTimeout = 30000
-        readTimeout = 120000
+        connectTimeout = 30000; readTimeout = 120000
     }
-
     val msgs = JSONArray().also { arr ->
-        history.forEach { msg ->
-            arr.put(JSONObject().apply {
-                put("role", msg.role)
-                put("content", msg.content)
-            })
-        }
+        history.forEach { m -> arr.put(JSONObject().apply {
+            put("role", m.role); put("content", m.content)
+        }) }
     }
     val body = JSONObject().apply {
-        put("model", CHAT_MODEL)
-        put("messages", msgs)
-        put("temperature", 0.3)
-        put("max_tokens", 512)
-        put("stream", false)
+        put("model", CHAT_MODEL); put("messages", msgs)
+        put("temperature", 0.3); put("max_tokens", 512); put("stream", false)
     }.toString()
 
     try {
         OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(body) }
         val code = conn.responseCode
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val respText = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        if (code !in 200..299) return@withContext "HTTP $code: $respText"
-
-        val root = JSONObject(respText)
+        val txt = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        if (code !in 200..299) return@withContext "HTTP $code: $txt"
+        val root = JSONObject(txt)
         val choices = root.optJSONArray("choices") ?: return@withContext "Пустой ответ"
         val first = choices.optJSONObject(0) ?: return@withContext "Пустой ответ"
         val message = first.optJSONObject("message")
         val content = message?.optString("content")
         if (!content.isNullOrBlank()) content else first.optString("text", "Пустой ответ")
-    } catch (e: Exception) {
-        "Ошибка: ${e.message}"
-    } finally {
-        conn.disconnect()
-    }
+    } catch (e: Exception) { "Ошибка: ${e.message}" }
+    finally { conn.disconnect() }
 }
 
-/* -------------------- TTS: clone + speak -------------------- */
+/* ---------- TTS (НЕ composable) ---------- */
+private suspend fun ensureVoice(ctx: Context, voiceId: String, assetName: String): Boolean {
+    return if (isVoiceOnServer(voiceId)) true else cloneVoiceFromAsset(ctx, assetName, voiceId)
+}
 
-/** Одноразовое клонирование голоса с отправкой voice_ref.wav из assets */
+private suspend fun isVoiceOnServer(voiceId: String): Boolean = withContext(Dispatchers.IO) {
+    val conn = (URL(TTS_HEALTH).openConnection() as HttpURLConnection).apply {
+        requestMethod = "GET"; connectTimeout = 15000; readTimeout = 15000
+    }
+    try {
+        if (conn.responseCode !in 200..299) return@withContext false
+        val resp = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val voices = JSONObject(resp).optJSONArray("voices") ?: return@withContext false
+        (0 until voices.length()).any { voices.optString(it) == voiceId }
+    } catch (_: Exception) { false }
+    finally { conn.disconnect() }
+}
+
 private suspend fun cloneVoiceFromAsset(ctx: Context, assetName: String, voiceId: String): Boolean =
     withContext(Dispatchers.IO) {
-        // читаем ассет в память
-        val bytes = try {
-            ctx.assets.open(assetName).use { it.readBytes() }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return@withContext false
-        }
-        // multipart/form-data: fields voice_id + file ref_audio
-        val boundary = "----JarvisBoundary${System.currentTimeMillis()}"
-        val url = URL(TTS_CLONE)
-        val conn = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-            connectTimeout = 30000
-            readTimeout = 120000
-        }
-
-        try {
-            DataOutputStream(conn.outputStream).use { out ->
-                fun writeField(name: String, value: String) {
-                    out.writeBytes("--$boundary\r\n")
-                    out.writeBytes("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
-                    out.writeBytes("$value\r\n")
-                }
-                fun writeFile(name: String, filename: String, data: ByteArray) {
-                    out.writeBytes("--$boundary\r\n")
-                    out.writeBytes("Content-Disposition: form-data; name=\"$name\"; filename=\"$filename\"\r\n")
-                    out.writeBytes("Content-Type: audio/wav\r\n\r\n")
-                    out.write(data)
-                    out.writeBytes("\r\n")
-                }
-
-                writeField("voice_id", voiceId)
-                writeFile("ref_audio", assetName, bytes)
-
-                out.writeBytes("--$boundary--\r\n")
-                out.flush()
-            }
-
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val resp = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            if (code !in 200..299) {
-                println("CLONE ERROR $code: $resp")
-                return@withContext false
-            }
-            // ожидаем {"ok":true, "voice_id": "..."}
-            JSONObject(resp).optBoolean("ok", false)
-        } catch (e: Exception) {
-            e.printStackTrace()
-            false
-        } finally {
-            conn.disconnect()
-        }
+        val bytes = try { ctx.assets.open(assetName).use { it.readBytes() } } catch (_: Exception) { return@withContext false }
+        multipartClone(voiceId, bytes, assetName)
     }
 
-/** Синтезирует wav-файл в cacheDir и возвращает путь к нему (или null при ошибке) */
-private suspend fun ttsSpeakToFile(text: String, voiceId: String, cacheDir: File): String? =
+private suspend fun cloneVoiceFromUri(ctx: Context, uri: Uri, voiceId: String): Boolean =
     withContext(Dispatchers.IO) {
-        val url = URL(TTS_SAY)
-        val conn = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
-            connectTimeout = 30000
-            readTimeout = 120000
-        }
+        val bytes = try { ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@withContext false }
+        catch (_: Exception) { return@withContext false }
+        multipartClone(voiceId, bytes, "voice.wav")
+    }
 
-        // Формируем body: voice_id, text, speed, language
+private fun multipartClone(voiceId: String, fileBytes: ByteArray, filename: String): Boolean {
+    val boundary = "----JarvisBoundary${System.currentTimeMillis()}"
+    val conn = (URL(TTS_CLONE).openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"; doOutput = true
+        setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        connectTimeout = 30000; readTimeout = 120000
+    }
+    return try {
+        DataOutputStream(conn.outputStream).use { out ->
+            fun field(n: String, v: String) {
+                out.writeBytes("--$boundary\r\n")
+                out.writeBytes("Content-Disposition: form-data; name=\"$n\"\r\n\r\n")
+                out.writeBytes("$v\r\n")
+            }
+            fun file(n: String, fn: String, data: ByteArray) {
+                out.writeBytes("--$boundary\r\n")
+                out.writeBytes("Content-Disposition: form-data; name=\"$n\"; filename=\"$fn\"\r\n")
+                out.writeBytes("Content-Type: audio/wav\r\n\r\n")
+                out.write(data); out.writeBytes("\r\n")
+            }
+            field("voice_id", voiceId); file("ref_audio", filename, fileBytes)
+            out.writeBytes("--$boundary--\r\n")
+        }
+        val code = conn.responseCode
+        val txt = (if (code in 200..299) conn.inputStream else conn.errorStream)
+            .bufferedReader(Charsets.UTF_8).use { it.readText() }
+        code in 200..299 && JSONObject(txt).optBoolean("ok", false)
+    } catch (_: Exception) { false }
+    finally { conn.disconnect() }
+}
+
+private suspend fun ttsSpeakToFile(text: String, voiceId: String, cacheDir: java.io.File): String? =
+    withContext(Dispatchers.IO) {
+        val conn = (URL(TTS_SAY).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"; doOutput = true
+            setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+            connectTimeout = 30000; readTimeout = 120000
+        }
         val params = listOf(
-            "text" to text,
-            "voice_id" to voiceId,
-            "speed" to "0.9",
-            "language" to "ru"
+            "text" to text, "voice_id" to voiceId, "speed" to "0.9", "language" to "ru"
         ).joinToString("&") { (k, v) -> k + "=" + URLEncoder.encode(v, "UTF-8") }
 
         try {
             OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(params) }
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            if (code !in 200..299) {
-                val err = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-                println("TTS ERROR $code: $err")
-                return@withContext null
-            }
-
-            // Сохраняем WAV во временный файл
-            val outFile = File.createTempFile("tts_", ".wav", cacheDir)
-            BufferedInputStream(stream).use { inp ->
-                FileOutputStream(outFile).use { fos ->
-                    val buf = ByteArray(32 * 1024)
-                    while (true) {
-                        val r = inp.read(buf)
-                        if (r <= 0) break
-                        fos.write(buf, 0, r)
-                    }
-                    fos.flush()
-                }
-            }
-            outFile.absolutePath
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        } finally {
-            conn.disconnect()
-        }
+            if (conn.responseCode !in 200..299) return@withContext null
+            val out = java.io.File.createTempFile("tts_", ".wav", cacheDir)
+            conn.inputStream.use { i -> FileOutputStream(out).use { o -> i.copyTo(o) } }
+            out.absolutePath
+        } catch (_: Exception) { null }
+        finally { conn.disconnect() }
     }
