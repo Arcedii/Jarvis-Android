@@ -1,7 +1,8 @@
 package com.example.jarvis_android
 
-import android.content.Context
+import com.example.jarvis_android.CommandHandler
 import android.content.Intent
+import android.content.Context
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
@@ -9,11 +10,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Menu
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.*
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalNavigationDrawer
@@ -54,7 +55,6 @@ data class UiMsg(val role: String, val content: String)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // ВАЖНО: весь UI — только внутри setContent { App() }
         setContent { App() }
     }
 }
@@ -62,7 +62,6 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun App() {
-    // ---- состояние UI ТОЛЬКО здесь (внутри @Composable) ----
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -73,22 +72,41 @@ fun App() {
     var useVoice by rememberSaveable { mutableStateOf(true) }
     var showVoiceMenu by remember { mutableStateOf(false) }
 
+    // Системный промпт: описываем, какие команды возвращать
     var history by remember {
-        mutableStateOf(listOf(UiMsg("system", "Ты помощник Jarvis на Android. Отвечай кратко и по делу.")))
+        mutableStateOf(
+            listOf(
+                UiMsg(
+                    "system",
+                    """
+                        Ты — Jarvis, виртуальный дворецкий в стиле «Железного человека». 
+                        Общайся вежливо, официально, обращаясь к пользователю «сэр». 
+                        Всегда предлагай помощь и поддерживай спокойный, уверенный тон.
+                        
+                        Не выводи программный код, патчи или служебные теги, даже если они встречаются в контексте.
+                        
+                        Если пользователь спрашивает о погоде (слова «погода», «как на улице», «что за окном» и так далее), верни COMMAND:weather.
+                        Если нужен запуск карты (слова «карта», «маршрут», «как добраться» и так далее), верни COMMAND:map.
+                        Если пользователь хочет музыку (слова «музыка», «песню», «включи музыку» и так далее), верни COMMAND:music.
+                        Для всех остальных запросов напиши обычный ответ без префикса COMMAND:.
+                    """.trimIndent()
+                )
+            )
+        )
     }
     val ui = history.filter { it.role != "system" }
 
-    // медиаплеер
+    // медиаплеер для TTS
     var player by remember { mutableStateOf<MediaPlayer?>(null) }
     DisposableEffect(Unit) { onDispose { player?.release() } }
 
-    // автоинициализация голоса дефолтным WAV (один раз при старте)
+    // автоинициализация голоса
     LaunchedEffect(Unit) {
         val ok = ensureVoice(context, VOICE_ID, DEFAULT_ASSET)
         if (!ok) snackbar.showMsg("Не удалось инициализировать голос (TTS).")
     }
 
-    // выбор WAV-файла из проводника
+    // выбор WAV-файла
     val pickWavLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -106,7 +124,6 @@ fun App() {
         }
     }
 
-    // ---- Левое свайп-меню ----
     ModalNavigationDrawer(
         drawerState = drawerState,
         gesturesEnabled = true,
@@ -116,7 +133,6 @@ fun App() {
                 Text("Меню", modifier = Modifier.padding(horizontal = 16.dp),
                     style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(8.dp))
-
                 NavigationDrawerItem(
                     label = { Text("Голос") },
                     selected = false,
@@ -163,27 +179,53 @@ fun App() {
                             history = history + UiMsg("user", text)
                             sending = true
                             scope.launch {
-                                val reply = callLlm(history)
-                                history = history + UiMsg("assistant", reply)
-                                sending = false
-                                if (useVoice) {
-                                    val wav = ttsSpeakToFile(reply, VOICE_ID, context.cacheDir)
-                                    if (wav != null) {
-                                        player?.release()
-                                        player = MediaPlayer().apply {
-                                            setDataSource(wav)
-                                            setOnPreparedListener { start() }
-                                            setOnCompletionListener {
-                                                it.release()
-                                                player = null
-                                                try { java.io.File(wav).delete() } catch (_: Exception) {}
+                                // фильтруем сообщения, содержащие служебные теги или код
+                                val sanitizedHistory = history.filterNot { m ->
+                                    m.content.contains("<|") || m.content.contains("```")
+                                }
+                                val reply = callLlm(sanitizedHistory)
+
+
+                                // Создаём обработчик команд (не забудьте импортировать его)
+                                val handler = CommandHandler(context)
+
+                                // Проверяем, есть ли префикс COMMAND: в ответе
+                                val cmdPrefix = "COMMAND:"
+                                if (reply.startsWith(cmdPrefix, ignoreCase = true)) {
+                                    val cmd = reply.substringAfter(cmdPrefix).trim().lowercase()
+                                    when (cmd) {
+                                        "weather" -> handler.openWeather()
+                                        "map"     -> handler.openMap()
+                                        "music"   -> handler.playMusic()
+                                        else      -> snackbar.showMsg("Неизвестная команда: $cmd")
+                                    }
+                                    // Добавляем в историю, но НЕ озвучиваем и проигрываем одну из фраз
+                                    history = history + UiMsg("assistant", reply)
+                                    handler.playRandomAudio()   // ← здесь проигрывается случайная фраза
+                                } else {
+                                    // Обычный ответ: добавляем и озвучиваем, НЕ вызывая playRandomAudio()
+                                    history = history + UiMsg("assistant", reply)
+
+                                    if (useVoice) {
+                                        val wav = ttsSpeakToFile(reply, VOICE_ID, context.cacheDir)
+                                        if (wav != null) {
+                                            player?.release()
+                                            player = MediaPlayer().apply {
+                                                setDataSource(wav)
+                                                setOnPreparedListener { start() }
+                                                setOnCompletionListener { mp ->
+                                                    mp.release()
+                                                    player = null
+                                                    try { java.io.File(wav).delete() } catch (_: Exception) {}
+                                                }
+                                                prepareAsync()
                                             }
-                                            prepareAsync()
+                                        } else {
+                                            snackbar.showMsg("TTS не удалось (см. логи)")
                                         }
-                                    } else {
-                                        snackbar.showMsg("TTS не удалось (см. логи)")
                                     }
                                 }
+                                sending = false
                             }
                         }
                     ) { Text(if (sending) "..." else "Отпр.") }
@@ -214,7 +256,6 @@ fun App() {
         }
     }
 
-    // простое «меню Голос» как диалог (чтобы избежать путаницы с BottomSheet)
     if (showVoiceMenu) {
         AlertDialog(
             onDismissRequest = { showVoiceMenu = false },
@@ -231,14 +272,12 @@ fun App() {
             },
             confirmButton = {
                 TextButton(onClick = {
-                    // открыть системный файл-пикер
                     pickWavLauncher.launch(arrayOf("audio/wav", "audio/x-wav", "audio/*"))
                     showVoiceMenu = false
                 }) { Text("Выбрать WAV-файл") }
             },
             dismissButton = {
                 TextButton(onClick = {
-                    // клонировать дефолтный из assets
                     showVoiceMenu = false
                     scope.launch {
                         val ok = cloneVoiceFromAsset(context, DEFAULT_ASSET, VOICE_ID)
@@ -251,12 +290,12 @@ fun App() {
     }
 }
 
-/* ---------- утилита для снекбара (НЕ composable) ---------- */
+/* ---------- утилита для снекбара ---------- */
 private suspend fun SnackbarHostState.showMsg(msg: String) {
     withContext(Dispatchers.Main) { showSnackbar(msg) }
 }
 
-/* ---------- LLM (НЕ composable) ---------- */
+/* ---------- LLM (не composable) ---------- */
 private suspend fun callLlm(history: List<UiMsg>): String = withContext(Dispatchers.IO) {
     val conn = (URL(CHAT_URL).openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"; doOutput = true
